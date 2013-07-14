@@ -1,0 +1,227 @@
+= Writing ELF Shared Library Wrappers
+
+The purpose of this document is collecting knowledge on implementing shared
+library wrappers on ELF systems with dynamic linker provided by `glibc`.
+
+== The problem
+
+Interposing a few functions from a shared library is a well-known technique
+for augmenting said functionality in order to achieve some useful effect.  For
+instance, one can interpose malloc-realloc-free calls to build a simple  memory
+allocation debugging tool.  On ELF systems, injecting an interposer
+library is usually done with `LD_PRELOAD`, and is not actually a complicated
+part of the whole task.
+
+Typically the interposer will act as a wrapper around the ``real'' function,
+using +dlsym(RTLD_NEXT, "'name'")+ to obtain its address.  This allows several
+interposers to nest.
+
+However, for OpenGL interposition in particular, even implementing a
+satisfactory interposition scheme has proven to be not-so-trivial due to the
+fact that many games load the OpenGL library dynamically with `dlopen`; for
+example, this is the usage model suggested by SDL (FIXME: why?  It doesn't
+seem to serve a purpose these days).
+
+Thus, the problem is: find an interposition mechanism that works well with
+both explicit dynamic linking and dynamic loading at runtime.  The following
+sections evaluate the possible approaches.
+
+== `LD_PRELOAD` with `dlopen`/`dlsym` interposition
+
+The obvious response to applications ``circumventing'' the interposer with
+`dlopen`-`dlsym` is to interpose one or both of those functions in the
+injected library.  However, this approach has drawbacks.
+
+First, an application can circumvent this mechanism by obtaining a handle to
+`libdl.so.2` to get the ``real'' `dlopen` and `dlsym` functions before looking
+up symbols from the OpenGL library.  At one point, this actually has led
+VirtualGL interposer to intercept calls to `dlopen("libdl.so*", ...)`.
+
+Second, this approach is prone to breakage when multiple interposers are
+present, preventing them to nest normally.  Depending on how eager the
+interposers are in `dl*` redirection, they may either create a mutual
+recursion (when a deeply nested interposer in the chain is forced to use a
+function from an ``outer'' interposer), or an ``outer'' interposer may call
+the function from the system library instead of the next interposer.
+
+To give a specific example, release of Steam on Linux with an overlay
+renderer library acting as an `LD_PRELOAD`-based interposer caused other tools
+to ``protect themselves'' from `dlsym` interposition, because the overlay
+library overrode `dlsym` (but not `dlopen`) so that both the application and
+the interposer received the same pointers to functions implemented in the
+overlay, which resulted in mutual recursion at runtime.
+
+Thus, attempts to solve the dynamic loading problem via `dlopen` interposition
+lead to an ``arms race'' (which is amusing and sad at the same time).
+
+== `LD_PRELOAD` breaks valid executables
+
+In addition to the problems explained in the previous section, `LD_PRELOAD` has a
+flaw that makes it unusable with some executables: its ``blind'' interposition
+of symbols by name only (without regard to the originating module) breaks
+executables that have a globally visible symbol with the same name as one of
+the symbols in the interposed library.  This was observed with
+https://github.com/apitrace/apitrace/wiki/Unigine-Heaven[Unigine Heaven
+benchmark with apitrace].
+
+
+== `LD_LIBRARY_PATH`
+
+One can use `LD_LIBRARY_PATH` to make the dynamic linker load the interposer
+library rather than the system library.  This eliminates the need to have
+`dlopen`/`dlsym` wrappers in the library, which simplifies development and
+makes the loading sequence easy to understand.
+
+=== Exported symbols
+
+However, making the interposer library look like a normal library from the
+dynamic linker's point of view also requires that it exports all symbols
+exported by the system library (an `LD_PRELOAD` module would only export those
+functions it intends to override).
+
+The are different ways to satisfy this requirement.  If there is no need to
+restrict the set of exported symbols, the interposer can link to the system
+library.  However, it cannot have its soname in the `DT_NEEDED` entry (because
+it would resolve back to itself), nor can it adjust it to allow nesting of
+interposers.  This can be solved by linking to an intermediate dummy library,
+which is substituted with a symlink to the system library or the next
+interposer at run time.  This is the approach implemented in
+https://github.com/kroki/glxoffload[kroki/glxoffload].  (FIXME: This probably
+does not work if the application uses `dlsym`?)
+
+This approach is not acceptable if the interposer should expose only a subset
+of symbols exported by the system library.  In the context of OpenGL, this may
+be required if the interposer is a debugging library that needs to catch all
+OpenGL calls.  Limiting the application via `glXGetProcAddress` and extension
+strings does not work for applications that link explicitly or use `dlsym`
+without checking the extension string.
+
+In this case, the author of the interposer library can either arrange that the
+library has explicit entry points for all exported functions, or use the
+linker audit interface to control symbol lookup (which has its own problems;
+details below).  In a basic implementation, those entry points act as a
+trivial forwarders: they need to lookup the address of the real function and
+jump to it.  Coding this in C is not convenient due to the need to preserve
+arguments.
+
+Notably, a simpler approach that also eliminates the runtime overhead of an
+indirect jump is available: the interposer library can use (abuse?) `IFUNC`
+symbols that it resolves at runtime to the symbols from the system library.
+This approach is used in https://github.com/amonakov/primus[primus].
+
+
+=== Issues
+
+
+`DT_RPATH`::
+If the executable contains a `DT_RPATH` tag, it has higher precedence than
+`LD_LIBRARY_PATH`; it does not allow to inject an interposer if the tag points
+to the location of system library.  This should be rare, as this particular
+use is discouraged, and overall `DT_RPATH` is deprecated in favor of
+`DT_RUNPATH`.
+
+
+Less efficient library loading::
+Non-empty `LD_LIBRARY_PATH` causes the linker to look up _all_ libraries there
+before trying the system cache.
+
+Interposer chaining::
+Unlike `LD_PRELOAD`, `LD_LIBRARY_PATH` does not provide a natural way to
+achieve interposer nesting with `RTLD_NEXT`.  The interposer needs to know
+the path to the next interposer in the chain (or the system library), which is
+typically provided to it in an environment variable (or a
+distribution-specific compiled-in default path is used).  This can be solved
+nicely with explicit support in the dynamic linker (`DT_NEEDED_NEXT` below).
+
+
+== `LD_AUDIT`
+
+The linker audit API allows to observe actions taken by the dynamic linker,
+such as library lookup and symbol resolution (an audit library provides
+callback functions invoked by the linker).  The API allows to influence the
+decisions as well: it is possible to substitute libraries or individual
+symbols.  Thus, a helper audit library can solve most of the disadvantages of
+`LD_LIBRARY_PATH` approach.
+
+Today, using `LD_AUDIT` just for library/symbol redirection
+http://sourceware.org/bugzilla/show_bug.cgi?id=15533[causes a performance
+degradation] that could be avoided; the patch is awaiting review.
+
+
+== ELF filters
+
+Support of ELF per-symbol `DT_FILTER`/`DT_AUXILIARY` tagging might allow
+efficient restriction of API exposed by an interposer without resorting to
+`IFUNC` or `LD_AUDIT`.  Unfortunately, `glibc`'s implementation does not
+support per-symbol tagging, and the presence of those tags in library headers
+merely affects the symbol lookup precedence.  (FIXME: then one of those should
+be equivalent to `DT_NEEDED`, except for, perhaps, being non-fatal?)
+
+
+== `DT_NEEDED_NEXT`
+
+A hypothetical extension to ELF would provide a natural way to handle nesting
+of interposers inserted via `LD_LIBRARY_PATH`.  Suppose a `DT_NEEDED_NEXT` tag
+in a shared library would cause the dynamic linker to:
+
+- Load the next library with the same soname in the search locations after the
+  current library (tail of `LD_LIBRARY_PATH` or the system `ld.so` cache);
+- Resolve external references from the current library using the next library
+  rather than itself.
+
+It's not clear whether the value of having such extension would justify the
+effort of implementing it.
+
+
+== Multilib environment
+
+On systems where binaries of different ABIs can coexist (most commonly x86
+32-bit + 64-bit multilib installations), it may be desirable to unambiguously
+specify the path to the interposer library rather than adding paths for all
+architectures in `LD_LIBRARY_PATH` (adding them to `LD_PRELOAD` would cause a
+linker warning at runtime).  The architecture cannot be discovered in advance:
+the executable specified to the wrapper may be a shell script rather than an
+ELF file (this appears to be a bug present in
+http://git.cworth.org/git/fips[fips]).
+
+The `glibc` linker will dynamically expand a special token `$LIB` in the
+library path to the distribution-specific directory name for the current
+architecture.  Using this allows to easily  build multilib-capable
+interposers.
+
+== Acknowledgments
+
+The author would like to acknowledge the following people and their work in
+the field:
+
+- Bruce Merry for http://bugle.sf.net[Bugle]: a cross-platform and cross-API
+  framework for OpenGL debugging with support for pluggable modules and
+  interactive investigation.  It's odd that it appears to be not widely known
+  and used
+
+- Carl Worth for http://git.cworth.org/git/fips[fips], a performance
+  measurement project; witnessing the never-ending struggle to get
+  `LD_PRELOAD` working finally made the author write these thoughts down
+
+- D.R. Commander for http://www.virtualgl.org[VirtualGL], a GLX
+  forking/offloading library
+
+- Jose Fonseca and Zack Rusin for https://github.com/apitrace/apitrace[apitrace],
+  a cross-platform and cross-API graphics tracing tool
+
+- Tomash Brechko for https://github.com/kroki/glxoffload[kroki/glxoffload], a
+  GLX forking/offloading library; for demonstrating the linking-to-a-symlink
+  trick, and for confirming the `DT_NEEDED_NEXT` idea
+
+== Shameless plug
+
+The author maintains https://github.com/amonakov/primus[primus], a GLX
+forking/offloading library based on `LD_LIBRARY_PATH` injection and
+`IFUNC` symbol redirection, and
+https://github.com/amonakov/libgl-switcheroo[libgl-switcheroo], a `FUSE`-based
+or `LD_AUDIT`-based tool for automated per-application dynamic library
+switching.
+
+== Executive summary
+
+`LD_PRELOAD` is not the right tool for injecting OpenGL interposers on Linux.
