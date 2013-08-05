@@ -19,8 +19,8 @@ interposers to nest.
 However, for OpenGL interposition in particular, even implementing a
 satisfactory interposition scheme has proven to be not-so-trivial due to the
 fact that many games load the OpenGL library dynamically with `dlopen`; for
-example, this is the usage model suggested by SDL (FIXME: why?  It doesn't
-seem to serve a purpose these days).
+example, this is the usage model suggested by SDL (probably to suggest
+application authors to respond to missing OpenGL library).
 
 Thus, the problem is: find an interposition mechanism that works well with
 both explicit dynamic linking and dynamic loading at runtime.  The following
@@ -86,8 +86,9 @@ it would resolve back to itself), nor can it adjust it to allow nesting of
 interposers.  This can be solved by linking to an intermediate dummy library,
 which is substituted with a symlink to the system library or the next
 interposer at run time.  This is the approach implemented in
-https://github.com/kroki/glxoffload[kroki/glxoffload].  (FIXME: This probably
-does not work if the application uses `dlsym`?)
+https://github.com/kroki/glxoffload[kroki/glxoffload].  This doesn't work for
+incorrect applications that try to load OpenGL extension functions with
+`dlsym` (but can be cured with an `LD_AUDIT` helper).
 
 This approach is not acceptable if the interposer should expose only a subset
 of symbols exported by the system library.  In the context of OpenGL, this may
@@ -154,8 +155,9 @@ Support of ELF per-symbol `DT_FILTER`/`DT_AUXILIARY` tagging might allow
 efficient restriction of API exposed by an interposer without resorting to
 `IFUNC` or `LD_AUDIT`.  Unfortunately, `glibc`'s implementation does not
 support per-symbol tagging, and the presence of those tags in library headers
-merely affects the symbol lookup precedence.  (FIXME: then one of those should
-be equivalent to `DT_NEEDED`, except for, perhaps, being non-fatal?)
+merely affects the symbol lookup precedence: the filtee is put before the
+filter in the lookup chain, the only difference being that missing auxiliary
+filtee is non-fatal.
 
 
 == `DT_NEEDED_NEXT`
